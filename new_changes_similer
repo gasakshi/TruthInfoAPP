@@ -1,0 +1,275 @@
+import streamlit as st
+import asyncio
+import aiohttp
+import random
+import os,re
+from database import *  # this contains the necessary database operations
+from final_vectore import *
+from asyncio import Semaphore
+from nltk.tag import pos_tag
+from dotenv import load_dotenv
+from pinecone import Pinecone
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
+from sentence_transformers import SentenceTransformer
+from comparing_answer import * # for similarity search
+
+# nltk.download('punkt')
+# nltk.download('averaged_perceptron_tagger')
+# nltk.download('stopwords')
+
+
+# Load the .env file
+load_dotenv()
+
+# Initialize Pinecone
+Pincone_API_KEY = os.getenv("pincone_API_KEY")  # Corrected variable name
+pc = Pinecone(api_key=Pincone_API_KEY)
+index_names = ["websitetext",  "quranx", "equran"]
+
+# index = pc.Index(name=index_names)
+
+# Initialize the model for converting text to vectors
+model = SentenceTransformer('all-MiniLM-L6-v2')
+
+# Streamlit UI
+st.title("Chat with Me")
+
+def extract_keywords(question):
+    stop_words = set(stopwords.words('english'))
+    word_tokens = word_tokenize(question)
+    # Filter tokens to remove stopwords and any punctuation
+    filtered_tokens = [word for word in word_tokens if word.isalnum() and word.lower() not in stop_words]
+    # Use POS tagging to select only nouns or proper nouns
+    tagged_tokens = pos_tag(filtered_tokens)
+    keywords = [word for word, tag in tagged_tokens if tag in ['NN', 'NNP', 'NNS', 'NNPS']]
+    # print(keywords)
+    return keywords
+
+
+async def query_index_async(index_name, query_vector_list):
+    index = pc.Index(name=index_name)
+    results = await asyncio.to_thread(index.query, vector=query_vector_list, top_k=15, include_metadata=True)
+    return results
+
+async def fetch_response(session, url, headers, data):
+    async with session.post(url, headers=headers, json=data) as response:
+        return await response.json()
+    
+
+
+def normalize_question(question):
+    """Normalize the question for consistent processing."""
+    question = question.lower().strip()
+    return question
+
+# Adjust the concurrency limit based on your system's capability
+CONCURRENCY_LIMIT = 45
+async def handle_query(question):
+    
+        normalized_question = normalize_question(question)
+        ans = similarity_search(normalized_question)
+        query_vector = model.encode(normalized_question)
+        query_vector_list = query_vector.tolist()
+
+        all_results = []
+        tasks = [query_index_async(index_name, query_vector_list) for index_name in index_names]
+        query_results = await asyncio.gather(*tasks)
+        
+
+        for results in query_results:
+            if results["matches"]:
+                all_results.extend(results["matches"])
+        random.shuffle(all_results)
+        if not all_results:
+            st.write("I don't know.")
+        else:
+            question_id = insert_question_once(normalized_question)
+            document_ids = [hit["id"] for hit in all_results]
+            keywords = extract_keywords(normalized_question)
+            metadata_list = [match.get("metadata", {}) for match in all_results]
+            api_key = os.getenv('OpenAI_API_KEY')
+            headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
+
+            async with aiohttp.ClientSession() as session:
+                tasks = []
+                for idx, (doc_id, metadata) in enumerate(zip(document_ids, metadata_list)):
+                    content = metadata.get("content", "content not available")
+                    # url = metadata.get("url", "URL not available")
+                    prompt = f"Based on the following document:{doc_id,content}, answer the question: {normalized_question} "
+                    data = {
+                        'model': "gpt-3.5-turbo",
+                        'temperature': 0.5,
+                        'max_tokens': 250,
+                        'messages': [
+                            {"role": "system", "content": "Provide answers to the question based solely on the provided document content without altering or manipulating the information of the document. Please analyze the provided document carefully. Respond with 'Don't know' for insufficient information or 'Document does not contain information' for unrelated content."},
+                            {"role": "user", "content": prompt}
+                        ],  
+                    }
+                    tasks.append(fetch_response(session, 'https://api.openai.com/v1/chat/completions', headers, data))
+
+                responses = await asyncio.gather(*tasks)
+
+                # Store relevant responses in the database
+            relevant_responses = []
+            semaphore = Semaphore(CONCURRENCY_LIMIT)
+            async def process_response(idx, response_data):
+                text_data = response_data.get('choices', [])[0].get('message', {}).get('content', 'No response.')
+                if is_response_relevant(text_data, keywords):
+                    similarity_score = await compute_similarities_async(ans, text_data)
+                    similarity_score = similarity_score or 0.0
+                    if similarity_score < 0.60:
+                        insert_answer(question_id, text_data, document_ids[idx])
+                    return response_data
+                return None
+
+            async def process_responses_concurrently():
+                tasks = []
+                for idx, response_data in enumerate(responses):
+                    async with semaphore:
+                        task = asyncio.create_task(process_response(idx, response_data))
+                        tasks.append(task)
+                results = await asyncio.gather(*tasks)
+                return [result for result in results if result is not None]
+
+            relevant_responses = await process_responses_concurrently()
+            # for idx, response_data in enumerate(responses):
+            #     text_data = response_data.get('choices', [])[0].get('message', {}).get('content', 'No response.')
+            #     if is_response_relevant(text_data, keywords):
+            #         relevant_responses.append(response_data)
+            #         similarity_score = await compute_similarities_async(ans, text_data)
+            #         similarity_score = similarity_score or 0.0
+            #         if similarity_score < 0.60:
+            #             insert_answer(question_id, text_data, document_ids[idx])
+                        
+                # Store responses and metadata in session state
+            st.session_state.responses = relevant_responses
+            st.session_state.metadata_list = metadata_list
+            st.session_state.keywords = keywords
+            st.session_state.document_ids = document_ids
+            st.session_state.ans = ans
+            st.session_state.question_id = question_id
+
+                # Reset pagination state
+            st.session_state.page = 1
+            st.session_state.total_pages = (len(relevant_responses) + per_page - 1) // per_page    
+                
+                
+
+
+def is_response_relevant(response_text,keywords):
+    # Define keywords or phrases that indicate a non-informative response
+    
+            negative_context_phrases = [
+            r"did not have any\s+(?:\w+\s+){0,3}?mentioned",
+            r"no mention of",
+            r"only mentions",
+            r"does not discuss",
+            r"The document does not mention the",   
+            r"lacks information on",
+            r"without any details on",
+            r"fails to provide",
+            r"no details are given about",
+            r"no information is provided on",
+            r"there is no mention of",
+            r"not discussed",
+            r"not included",
+            r"document does not",
+            r"omits",
+            r"is not specified",
+            r"Don't know",
+            r"does not directly",
+            r"the document does not explicitly mention",
+            r"no reference to",
+            r"absent in the document",
+            r"it does not specify",
+            r"The document does not provide information about",
+            r"The document does not specify the exact",
+            r"the document does not specify",
+            r"is not explicitly mentioned",
+            "Document does not contain information",
+            r"not mentioned in provided",
+        ]
+            combined_pattern = r'|'.join(negative_context_phrases)
+        
+        # Check if response explicitly states a lack of information about key topics
+            if re.search(combined_pattern, response_text, re.IGNORECASE):
+                for keyword in keywords:
+                    keyword_pattern = rf'\b{re.escape(keyword)}\b'
+                    if re.search(keyword_pattern, response_text, re.IGNORECASE):
+                        print(f"Filtered out due to irrelevance: {response_text}")
+                    return False
+            return True
+
+
+def display_responses():
+    if 'responses' not in st.session_state or not st.session_state.responses:
+        return
+    responses=st.session_state.responses 
+    responses = st.session_state.responses
+    page = st.session_state.page
+
+    if st.session_state.responses:
+        st.empty()
+    if 'page' not in st.session_state:
+        st.session_state.page = 1
+    
+    start_idx = (st.session_state.page - 1) * per_page
+    end_idx = min(start_idx + per_page, len(st.session_state.responses))  # Handle potential out-of-bounds indexing
+    paginated_responses = responses[start_idx:end_idx]
+    
+    if not responses or len(responses) < (page-1) * per_page:
+    # Only generate responses if not already done for this page
+        asyncio.run(handle_query(question))
+
+    for idx, response_data in enumerate(paginated_responses):
+        text_data = response_data.get('choices', [])[0].get('message', {}).get('content', 'No response.')
+        st.write(start_idx + idx + 1)
+        st.write(f"**URL:** {st.session_state.metadata_list[start_idx + idx].get('url', 'URL not available')}")
+        st.write(f"**Response:** {text_data}")
+
+    if st.session_state.responses:
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col1:
+            if st.session_state.page > 1:
+                st.button("Previous", on_click=previous_page)
+        with col2:
+            st.write(f"Page {st.session_state.page} of {st.session_state.total_pages}")
+        with col3:
+            if st.session_state.page < st.session_state.total_pages:
+                st.button("Next", on_click=next_page)    
+        
+                
+
+if 'responses' not in st.session_state:
+    st.session_state.responses = []
+if 'metadata_list' not in st.session_state:
+    st.session_state.metadata_list = []
+if 'keywords' not in st.session_state:
+    st.session_state.keywords = []
+if 'document_ids' not in st.session_state:
+    st.session_state.document_ids = []
+if 'ans' not in st.session_state:
+    st.session_state.ans = ''
+if 'question_id' not in st.session_state:
+    st.session_state.question_id = None
+if 'page' not in st.session_state:
+    st.session_state.page = 1
+if 'total_pages' not in st.session_state:
+    st.session_state.total_pages = 0
+
+per_page = 15
+if st.session_state.responses:
+    st.session_state.total_pages = (len(st.session_state.responses) + per_page - 1) // per_page
+def previous_page():
+        st.session_state.page -= 1
+
+def next_page():
+        st.session_state.page += 1
+question = st.text_input("Enter your question:", "")
+if st.button("Submit"):
+    asyncio.run(handle_query(question))
+    # display_responses()
+
+if st.session_state.responses:
+    display_responses()
